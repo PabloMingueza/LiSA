@@ -1,0 +1,84 @@
+import os
+import torch
+import torchaudio
+import pandas as pd
+from PIL import Image
+from torch.utils.data import Dataset
+
+
+class LiSADataset(Dataset):
+    def __init__(self, root_dir, sequence_list=None, transform=None, audio_transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.audio_transform = audio_transform
+
+        # Si no se pasa lista de secuencias, usar todas
+        self.sequence_list = sequence_list or sorted(os.listdir(root_dir))
+        self.samples = []
+        for seq in self.sequence_list:
+            seq_path = os.path.join(root_dir, seq)
+            gt_path = os.path.join(seq_path, "gt.csv")
+            gt = pd.read_csv(gt_path)
+            self.gt_data[seq] = gt
+
+            for idx in range(len(gt)):
+                sample = {
+                    "sequence": seq,
+                    "index": idx,
+                    # Asumiendo que las posiciones de las fuentes (sx, sy, sz) son el ground truth
+                    "gt": gt.iloc[idx][["sx", "sy", "sz"]].values.astype("float32"),
+                    # Coordenadas de los microfonos (m0x, m0y, m0z, m1x, m1y, etc.)
+                    "mic_coordinates": {
+                        "m0": gt.iloc[idx][["m0x", "m0y", "m0z"]].values.astype("float32"),
+                        "m1": gt.iloc[idx][["m1x", "m1y", "m1z"]].values.astype("float32"),
+                        "m2": gt.iloc[idx][["m2x", "m2y", "m2z"]].values.astype("float32"),
+                        "m3": gt.iloc[idx][["m3x", "m3y", "m3z"]].values.astype("float32"),
+                    },
+                    # Orientacion de los microfonos
+                    "mic_angles": {
+                        "m0_theta": gt.iloc[idx]["m0theta"],
+                        "m1_theta": gt.iloc[idx]["m1theta"],
+                        "m2_theta": gt.iloc[idx]["m2theta"],
+                        "m3_theta": gt.iloc[idx]["m3theta"],
+                    },
+                }
+                self.samples.append(sample)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        seq_path = os.path.join(self.root_dir, sample["sequence"])
+        frame_path = os.path.join(seq_path, "images", f"img_{sample['index']}.png") #ruta al archivo
+
+        # Cargar imagen
+        image = Image.open(frame_path).convert("RGB")
+        if self.transform:  # en el caso que definamos una transformacion para las imagenes
+            image = self.transform(image)
+
+        # Cargar audios y convertir a espectrograma
+        spec_list = []
+        for i in range(4):
+            audio_path = os.path.join(seq_path, "sound", f"output_{i}.wav")
+            waveform, sample_rate = torchaudio.load(audio_path)
+            # Tomar el fragmento correspondiente al tiempo actual
+            duration = 1 / 20  # 20 Hz → cada muestra dura 0.05 s
+            start_frame = int(sample["index"] * duration * sample_rate)
+            end_frame = start_frame + int(duration * sample_rate)
+            segment = waveform[:, start_frame:end_frame]
+
+            # Transformar a espectrograma
+            if self.audio_transform:
+                spec = self.audio_transform(segment)
+            else:
+                spec = segment  # O simplemente raw audio si no hay transformación
+
+            spec_list.append(spec)
+
+        # Concatenar en un solo tensor (por ejemplo en el eje canal)
+        audio_tensor = torch.cat(spec_list, dim=0)  # shape: (4, freq, time) o (4, n_samples)
+
+        target = torch.tensor(sample["gt"], dtype=torch.float32)
+
+        return image, audio_tensor, target
